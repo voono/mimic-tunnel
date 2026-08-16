@@ -34,13 +34,18 @@ interface.
 Run on **each** server, as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/voono/mimic-tunnel/main/mimic-tunnel.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/voono/mimic-tunnel/main/mimic-tunnel.sh -o /tmp/mimic-tunnel.sh
+sudo bash /tmp/mimic-tunnel.sh install
 ```
 
-This downloads the script, runs the interactive installer (asks which role
-this server plays), and installs itself to `/usr/local/sbin/mimic-tunnel` so
-you can manage it afterwards with just `mimic-tunnel <command>` — no need to
-re-download.
+This downloads the script and runs the interactive installer (asks which
+role this server plays), which installs itself to
+`/usr/local/sbin/mimic-tunnel` so you can manage it afterwards with just
+`mimic-tunnel <command>` — no need to re-download.
+
+(Don't pipe curl straight into `bash -s`: the installer is interactive and
+needs your terminal's stdin for its prompts, which a pipe replaces with the
+script itself — download to a file first, as above.)
 
 Prefer to inspect the script first, or keep a local clone to update via
 `git pull`?
@@ -53,7 +58,7 @@ sudo ./mimic-tunnel.sh install
 
 ### Updating
 
-Re-run the same one-liner (or `git pull` + `sudo ./mimic-tunnel.sh install`
+Re-run the same two commands (or `git pull` + `sudo ./mimic-tunnel.sh install`
 if you cloned). It's safe to re-run at any time:
 
 - Existing config is offered back to you as the default at each prompt.
