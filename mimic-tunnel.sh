@@ -393,6 +393,16 @@ EOF
   systemctl daemon-reload
 }
 
+# Recreates mimic-tunnel-rules.service if it's missing, e.g. from an
+# interrupted or older/buggy install run. Without it, rules applied live by
+# `tunnel add`/`edit`/`remove` work now but won't be reapplied on reboot.
+ensure_rules_service() {
+  [[ -f "$RULES_UNIT" ]] && return 0
+  c_yellow "-> mimic-tunnel-rules.service was missing (likely from an earlier interrupted install) - recreating it."
+  install_rules_service
+  systemctl enable --now mimic-tunnel-rules.service
+}
+
 # ============================================================
 # Commands: global per-server setup
 # ============================================================
@@ -567,6 +577,7 @@ cmd_tunnel_add() {
   need_root
   [[ -f "$GLOBAL_FILE" ]] || die "Run 'mimic-tunnel install' first (sets up role/interface for this server)."
   load_global
+  ensure_rules_service
 
   local name="${1:-}"
   if [[ -z "$name" ]]; then
@@ -769,10 +780,16 @@ cmd_status() {
   systemctl --no-pager --full status "mimic@${IFACE}" || true
   echo
   echo "--- systemd: mimic-tunnel-rules ---"
-  systemctl --no-pager --full status mimic-tunnel-rules.service || true
+  if [[ ! -f "$RULES_UNIT" ]]; then
+    c_yellow "Warning: $RULES_UNIT is missing - current iptables rules are active but won't be"
+    c_yellow "reapplied on reboot. Fix it with: mimic-tunnel tunnel add <existing-tunnel-name>"
+    c_yellow "(reconfigures in place and self-heals this) or re-run: mimic-tunnel install"
+  else
+    systemctl --no-pager --full status mimic-tunnel-rules.service || true
+  fi
   echo
   echo "--- active Mimic connections ---"
-  mimic show -c || true
+  mimic show -c "$IFACE" || true
   if [[ "$ROLE" == "server1" ]] && command -v wg >/dev/null 2>&1; then
     echo
     echo "--- WireGuard ---"
@@ -794,7 +811,7 @@ cmd_stats() {
   iptables -L INPUT -n -v --line-numbers | grep -E "Chain|$tag" || true
   echo
   echo "--- active Mimic connections ---"
-  mimic show -c || true
+  mimic show -c "$IFACE" || true
 }
 
 usage() {
