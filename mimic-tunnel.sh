@@ -205,13 +205,20 @@ tunnel_rules() {
   local name="$1" action="$2" peer_ip="$3" disguise_port="$4" port="$5"
   local tag="${COMMENT_TAG}:${name}"
   if [[ "$ROLE" == "server1" ]]; then
+    # REDIRECT rewrites the destination port before INPUT sees the packet,
+    # so the accept rules must match the post-redirect port ($port), not
+    # $disguise_port - matching the old port here is a no-op rule that only
+    # looked correct because INPUT's default policy is usually ACCEPT anyway.
     _rule nat    PREROUTING "-p udp -s $peer_ip --dport $disguise_port -m comment --comment $tag -j REDIRECT --to-port $port" "$action"
-    _rule filter INPUT      "-p tcp -s $peer_ip --dport $disguise_port -m comment --comment $tag -j ACCEPT" "$action"
-    _rule filter INPUT      "-p udp -s $peer_ip --dport $disguise_port -m comment --comment $tag -j ACCEPT" "$action"
+    _rule filter INPUT      "-p tcp -s $peer_ip --dport $port -m comment --comment $tag -j ACCEPT" "$action"
+    _rule filter INPUT      "-p udp -s $peer_ip --dport $port -m comment --comment $tag -j ACCEPT" "$action"
   else
-    _rule nat PREROUTING  "-p udp --dport $port -m comment --comment $tag -j DNAT --to-destination ${peer_ip}:${disguise_port}" "$action"
-    _rule nat POSTROUTING "-p udp -d $peer_ip --dport $disguise_port -m comment --comment $tag -j MASQUERADE" "$action"
-    _rule filter INPUT    "-p udp --dport $port -m comment --comment $tag -j ACCEPT" "$action"
+    # DNAT rewrites the destination to a non-local IP, so the routing
+    # decision sends the packet to FORWARD, never INPUT - an INPUT rule here
+    # can never match. FORWARD must accept the post-DNAT destination.
+    _rule nat    PREROUTING "-p udp --dport $port -m comment --comment $tag -j DNAT --to-destination ${peer_ip}:${disguise_port}" "$action"
+    _rule nat    POSTROUTING "-p udp -d $peer_ip --dport $disguise_port -m comment --comment $tag -j MASQUERADE" "$action"
+    _rule filter FORWARD    "-p udp -d $peer_ip --dport $disguise_port -m comment --comment $tag -j ACCEPT" "$action"
   fi
 }
 
