@@ -499,9 +499,11 @@ cmd_uninstall() {
   systemctl daemon-reload
 
   rm -f "/etc/mimic/${IFACE}.conf"
+  rmdir /etc/mimic 2>/dev/null || true
   rm -rf "$TUNNELS_DIR"
   rm -f "$GLOBAL_FILE"
   rmdir "$STATE_DIR" 2>/dev/null || true
+  rm -f "$INSTALL_PATH"
 
   if (( purge )); then
     c_yellow "-> Purging the mimic package and kernel module..."
@@ -513,6 +515,11 @@ cmd_uninstall() {
   c_green "== Uninstalled =="
   if (( ! purge )); then
     echo "Note: the mimic package itself was left installed. Use 'uninstall --purge' to remove it too."
+  fi
+  if [[ "$ROLE" == "server2" ]]; then
+    echo "Note: net.ipv4.ip_forward=1 (set in /etc/sysctl.conf by install) was left as-is in case"
+    echo "anything else on this server relies on it. Revert manually if you don't need it:"
+    echo "    sudo sed -i 's/^net.ipv4.ip_forward=1/net.ipv4.ip_forward=0/' /etc/sysctl.conf && sudo sysctl -p"
   fi
 }
 

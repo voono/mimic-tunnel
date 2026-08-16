@@ -205,6 +205,17 @@ sudo mimic-tunnel uninstall             # remove everything: all tunnels, config
 sudo mimic-tunnel uninstall --purge     # also remove the mimic package + kernel module
 ```
 
+`tunnel remove` cleans up that tunnel's iptables rules, its `filter =` line,
+and its config file, leaving other tunnels untouched. `uninstall` stops the
+services (which tears down every tunnel's iptables rules on the way down),
+then deletes the config, the Mimic filter file, the systemd unit, and the
+installed `/usr/local/sbin/mimic-tunnel` binary. Left behind on purpose:
+
+- The `mimic` package and kernel module, unless you pass `--purge`.
+- `net.ipv4.ip_forward=1` on Server 2 (set persistently by install) — not
+  reverted automatically in case something else on the box relies on it;
+  `uninstall` prints the one-liner to undo it if you don't need it.
+
 ## References
 
 - [Mimic](https://github.com/hack3ric/mimic) — the eBPF UDP→TCP obfuscator this relies on.
