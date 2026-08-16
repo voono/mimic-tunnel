@@ -319,6 +319,15 @@ check_distro_and_kernel() {
   if (( kmajor < 6 || (kmajor == 6 && kminor < 1) )); then
     die "Kernel $KVER is older than 6.1; Mimic requires dynptrs (kernel >=6.1)."
   fi
+
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    local virt
+    virt="$(systemd-detect-virt 2>/dev/null || true)"
+    case "$virt" in
+      lxc|lxc-libvirt|openvz|docker|podman|containerd|systemd-nspawn)
+        die "This server appears to be a $virt container, which shares the host's kernel and generally can't load a custom DKMS module or attach eBPF/XDP - both of which Mimic needs. You'll need a KVM/full-virtualization VPS (or bare metal) instead. If you're confident this environment actually supports it, you're on your own past this point - the check is here because 'modprobe mimic' failing silently is otherwise very confusing to debug." ;;
+    esac
+  fi
 }
 
 install_prerequisites() {
@@ -446,18 +455,19 @@ cmd_install() {
   check_distro_and_kernel
   install_prerequisites
   install_mimic_package
-  modprobe mimic
+  install_self
+  modprobe mimic || die "Could not load the 'mimic' kernel module. This usually means either the DKMS build failed for your kernel ($KVER) - check 'dmesg | tail' and matching linux-headers - or this environment can't load custom kernel modules at all (e.g. a container without host cooperation). mimic-tunnel is already installed at $INSTALL_PATH if you need to uninstall or retry."
   echo mimic > /etc/modules-load.d/mimic.conf
 
   write_global
   mkdir -p "$TUNNELS_DIR"
   regen_mimic_filter_config
-  install_self
   install_rules_service
   systemctl enable --now mimic-tunnel-rules.service
 
   if [[ "$ROLE" == "server2" ]]; then
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || \
+      c_yellow "Warning: could not set net.ipv4.ip_forward live (this environment may restrict sysctl writes) - it's saved in /etc/sysctl.conf so it should take effect on next boot; set it manually now if you need it immediately."
     if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
       sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
     else

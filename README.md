@@ -26,6 +26,14 @@ interface.
   These are the only distros the official Mimic `.deb` packages target. Other
   distros need Mimic [built from source](https://github.com/hack3ric/mimic/blob/master/docs/building.md).
 - Kernel ≥ 6.1 (needed for eBPF dynptrs).
+- **KVM/full-virtualization VPS or bare metal — not a container-based VPS**
+  (OpenVZ, LXC, plain Docker). Mimic needs to load a custom DKMS kernel
+  module and attach an eBPF/XDP program, neither of which is possible in a
+  container sharing the host's kernel. This trips up cheap "gaming" VPS
+  resellers a lot — if unsure, ask your provider what virtualization they
+  use, or check with `systemd-detect-virt` (should say `kvm`/`none`, not
+  `lxc`/`openvz`/`docker`). The installer checks this automatically before
+  it starts.
 - Root access on both servers.
 - WireGuard already set up on Server 1.
 
