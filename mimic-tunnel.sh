@@ -336,20 +336,24 @@ install_mimic_package() {
   c_yellow "-> Fetching latest Mimic release for ${CODENAME}/${ARCH}..."
   local tmpdir api_json all_urls mimic_url dkms_url
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
 
-  api_json="$(curl -fsL https://api.github.com/repos/hack3ric/mimic/releases/latest 2>/dev/null)" || \
+  api_json="$(curl -fsL https://api.github.com/repos/hack3ric/mimic/releases/latest 2>/dev/null)" || {
+    rm -rf "$tmpdir"
     die "Could not reach GitHub's API to fetch the latest Mimic release (it may be rate-limited - try again shortly)."
+  }
   all_urls="$(echo "$api_json" | grep -oE 'https://github\.com/hack3ric/mimic/releases/download/[^"]+\.deb' || true)"
 
   mimic_url="$(echo "$all_urls" | grep "${CODENAME}_mimic_" | grep -v dkms | grep "_${ARCH}\.deb" | head -1 || true)"
   dkms_url="$(echo "$all_urls"  | grep "${CODENAME}_mimic-dkms_"        | grep "_${ARCH}\.deb" | head -1 || true)"
 
-  [[ -n "$mimic_url" && -n "$dkms_url" ]] || \
+  if [[ -z "$mimic_url" || -z "$dkms_url" ]]; then
+    rm -rf "$tmpdir"
     die "Could not find a matching package for ${CODENAME}/${ARCH} in the latest release (GitHub's API may be rate-limited - try again in a bit). Check manually: https://github.com/hack3ric/mimic/releases"
+  fi
 
   wget -q -P "$tmpdir" "$mimic_url" "$dkms_url"
   apt-get install -y -qq "$tmpdir"/*.deb
+  rm -rf "$tmpdir"
 }
 
 install_self() {
