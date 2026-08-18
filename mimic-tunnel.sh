@@ -762,6 +762,19 @@ cmd_start()   { need_root; load_global; systemctl start "mimic@${IFACE}"; c_gree
 cmd_stop()    { need_root; load_global; systemctl stop "mimic@${IFACE}"; c_yellow "Stopped (obfuscation is off; iptables rules are still in place)."; }
 cmd_restart() { need_root; load_global; systemctl restart "mimic@${IFACE}"; c_green "Restarted."; }
 
+# Mimic runs one shared instance per interface for every tunnel, so `mimic
+# show -c` always lists every tunnel's connections. When a specific tunnel
+# name was asked for, keep only the blocks whose "=> ip:port" matches that
+# tunnel's peer, so e.g. `status tunnel1` doesn't show tunnel-de's traffic.
+filter_mimic_connections() {
+  local match="$1"
+  awk -v m="$match" '
+    /^Connection / { keep = (index($0, "=> " m) > 0) }
+    /^Connection / || /^  / { if (keep) print; next }
+    { print }
+  '
+}
+
 cmd_status() {
   need_root
   load_global
@@ -796,7 +809,11 @@ cmd_status() {
   fi
   echo
   echo "--- active Mimic connections ---"
-  mimic show -c "$IFACE" || true
+  if [[ -n "$name" ]]; then
+    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}"
+  else
+    mimic show -c "$IFACE" || true
+  fi
   if [[ "$ROLE" == "server1" ]] && command -v wg >/dev/null 2>&1; then
     echo
     echo "--- WireGuard ---"
@@ -818,7 +835,12 @@ cmd_stats() {
   iptables -L INPUT -n -v --line-numbers | grep -E "Chain|$tag" || true
   echo
   echo "--- active Mimic connections ---"
-  mimic show -c "$IFACE" || true
+  if [[ -n "$name" ]]; then
+    load_tunnel "$name"
+    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}"
+  else
+    mimic show -c "$IFACE" || true
+  fi
 }
 
 usage() {
