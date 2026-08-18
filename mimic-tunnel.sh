@@ -800,6 +800,27 @@ filter_mimic_connections() {
   '
 }
 
+# A busy relay can be juggling dozens/hundreds of concurrent flows (e.g. many
+# players); print only the first MAX_SHOWN_CONNECTIONS blocks plus a count of
+# how many were hidden, instead of flooding the terminal.
+MAX_SHOWN_CONNECTIONS=20
+limit_mimic_connections() {
+  local max="$MAX_SHOWN_CONNECTIONS" content total
+  content="$(cat)"
+  total="$(grep -c '^Connection ' <<<"$content")"
+  if [[ "$content" == "Connection no active connection" ]] || (( total <= max )); then
+    printf '%s\n' "$content"
+    return
+  fi
+  awk -v max="$max" '
+    /^Connection / { n++ }
+    n > max { next }
+    { print }
+  ' <<<"$content"
+  echo
+  c_yellow "... and $(( total - max )) more connection(s) not shown (showing first $max of $total)"
+}
+
 cmd_status() {
   need_root
   load_global
@@ -842,9 +863,9 @@ cmd_status() {
   echo
   echo "--- active Mimic connections ---"
   if [[ -n "$name" ]]; then
-    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}"
+    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}" | limit_mimic_connections || true
   else
-    mimic show -c "$IFACE" || true
+    mimic show -c "$IFACE" 2>/dev/null | limit_mimic_connections || true
   fi
   if [[ "$ROLE" == "server1" ]] && command -v wg >/dev/null 2>&1; then
     echo
@@ -872,9 +893,9 @@ cmd_stats() {
   echo "--- active Mimic connections ---"
   if [[ -n "$name" ]]; then
     load_tunnel "$name"
-    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}"
+    mimic show -c "$IFACE" 2>/dev/null | filter_mimic_connections "${PEER_IP}:${DISGUISE_PORT}" | limit_mimic_connections || true
   else
-    mimic show -c "$IFACE" || true
+    mimic show -c "$IFACE" 2>/dev/null | limit_mimic_connections || true
   fi
 }
 
