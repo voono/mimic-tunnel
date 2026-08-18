@@ -226,6 +226,27 @@ tunnel_rules() {
 # DISGUISE_PORT) uniquely identifies a tunnel's rules for the current ROLE.
 tunnel_port_var() { [[ "$ROLE" == "server1" ]] && echo WG_PORT || echo CLIENT_PORT; }
 
+# Deletes every iptables rule carrying a mimic-tunnel comment tag, across all
+# tables/chains this script ever writes to - regardless of which tunnel it
+# belonged to or what its current config says. This is the only reliable way
+# to clear rules left behind by drift (e.g. a stale rule whose "old" values
+# no longer match what's actually in iptables, so a targeted -D silently
+# no-ops). Used before a full reconcile so re-adding current tunnels always
+# converges to the right state instead of layering on top of leftovers.
+flush_all_mimic_tunnel_rules() {
+  local table chain line spec
+  for table in nat filter; do
+    for chain in PREROUTING POSTROUTING INPUT FORWARD; do
+      while IFS= read -r line; do
+        [[ "$line" == "-A $chain "* ]] || continue
+        [[ "$line" == *"${COMMENT_TAG}:"* ]] || continue
+        spec="${line#-A "$chain" }"
+        eval "iptables -t \"\$table\" -D \"\$chain\" $spec" 2>/dev/null || true
+      done < <(iptables -t "$table" -S "$chain" 2>/dev/null)
+    done
+  done
+}
+
 apply_tunnel_from_disk() {
   local name="$1" action="$2" portvar port
   load_tunnel "$name"
@@ -243,6 +264,11 @@ cmd_apply_rules() {
   if [[ -n "$name" ]]; then
     apply_tunnel_from_disk "$name" "$action"
   else
+    # Full reconcile (this is what boots/restarts the rules service run):
+    # wipe every mimic-tunnel-tagged rule first so leftover/stale rules from
+    # past drift can never shadow the current config, then lay down exactly
+    # what's configured now.
+    [[ "$action" == "add" ]] && flush_all_mimic_tunnel_rules
     local n
     for n in $(list_tunnel_names); do
       apply_tunnel_from_disk "$n" "$action"
@@ -833,6 +859,9 @@ cmd_stats() {
   echo
   echo "--- filter/INPUT ---"
   iptables -L INPUT -n -v --line-numbers | grep -E "Chain|$tag" || true
+  echo
+  echo "--- filter/FORWARD ---"
+  iptables -L FORWARD -n -v --line-numbers | grep -E "Chain|$tag" || true
   echo
   echo "--- active Mimic connections ---"
   if [[ -n "$name" ]]; then
