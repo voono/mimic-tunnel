@@ -509,13 +509,12 @@ cmd_install() {
   systemctl enable --now mimic-tunnel-rules.service
 
   if [[ "$ROLE" == "server2" ]]; then
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || \
-      c_yellow "Warning: could not set net.ipv4.ip_forward live (this environment may restrict sysctl writes) - it's saved in /etc/sysctl.conf so it should take effect on next boot; set it manually now if you need it immediately."
-    if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null; then
-      sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    else
-      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
+    # A dedicated sysctl.d fragment survives package upgrades that reset
+    # /etc/sysctl.conf to its packaged default (e.g. procps) - editing that
+    # file in place doesn't.
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-mimic-tunnel-forward.conf
+    sysctl -p /etc/sysctl.d/99-mimic-tunnel-forward.conf >/dev/null 2>&1 || \
+      c_yellow "Warning: could not set net.ipv4.ip_forward live (this environment may restrict sysctl writes) - it's saved in /etc/sysctl.d/99-mimic-tunnel-forward.conf so it should take effect on next boot; set it manually now if you need it immediately."
   fi
 
   systemctl enable --now "mimic@${IFACE}"
@@ -809,6 +808,13 @@ cmd_status() {
   echo "Role:          $ROLE"
   echo "Interface:     $IFACE"
   [[ "$ROLE" == "server1" ]] && echo "Public IP:     $PUBLIC_IP"
+  if [[ "$ROLE" == "server2" ]]; then
+    local fwd
+    fwd="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo '?')"
+    if [[ "$fwd" != "1" ]]; then
+      c_red "IP forwarding is OFF (net.ipv4.ip_forward=$fwd) - DNAT'd traffic is silently dropped before it ever reaches the peer. Fix: sysctl -w net.ipv4.ip_forward=1 (re-run 'mimic-tunnel install' to persist it properly)."
+    fi
+  fi
   echo
   if [[ -n "$name" ]]; then
     load_tunnel "$name"
