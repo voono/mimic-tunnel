@@ -49,6 +49,21 @@ c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 die() { c_red "Error: $*"; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || die "This command must be run as root (sudo)."; }
 
+# Any command failing under `set -e` otherwise ends the script with zero
+# output, which looks exactly like "the installer just stopped halfway
+# through". The classic source is a conditional as the *last* statement of a
+# function (a bare `[[ ... ]] && echo ...`), which makes the function itself
+# return 1 - that bug shipped twice already. set -E propagates the trap into
+# functions and subshells so it fires wherever errexit would.
+set -E
+on_err() {
+  local status="$1" line="$2" cmd="$3"
+  c_red "Error: command '${cmd}' failed with status ${status} at line ${line} - aborting."
+  c_red "This is a bug or an environment problem; nothing after this point ran."
+  exit "$status"
+}
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 # ask VAR "prompt text" [default]
 # Always prompts interactively. If VAR is already set (e.g. from a previous
 # install, or exported by the caller) that value is offered as the default.
@@ -116,10 +131,15 @@ load_global() {
 
 write_global() {
   mkdir -p "$STATE_DIR"
+  # Note the `if` rather than `[[ ... ]] && echo`: as the last statement of
+  # the group, a false test would make this whole function return 1 and kill
+  # the script under `set -e` on every server2 install.
   {
     echo "ROLE=$ROLE"
     echo "IFACE=$IFACE"
-    [[ "$ROLE" == "server1" ]] && echo "PUBLIC_IP=$PUBLIC_IP"
+    if [[ "$ROLE" == "server1" ]]; then
+      echo "PUBLIC_IP=$PUBLIC_IP"
+    fi
   } > "$GLOBAL_FILE"
 }
 
@@ -163,7 +183,7 @@ value_used_by_other_tunnel() {
   local field="$1" value="$2" exclude="$3" n v
   for n in $(list_tunnel_names); do
     [[ "$n" == "$exclude" ]] && continue
-    v="$(grep -E "^${field}=" "$TUNNELS_DIR/${n}.conf" 2>/dev/null | cut -d= -f2-)"
+    v="$(grep -E "^${field}=" "$TUNNELS_DIR/${n}.conf" 2>/dev/null | cut -d= -f2- || true)"
     if [[ "$v" == "$value" ]]; then
       echo "$n"
       return 0
@@ -242,9 +262,79 @@ flush_all_mimic_tunnel_rules() {
         [[ "$line" == *"${COMMENT_TAG}:"* ]] || continue
         spec="${line#-A "$chain" }"
         eval "iptables -t \"\$table\" -D \"\$chain\" $spec" 2>/dev/null || true
-      done < <(iptables -t "$table" -S "$chain" 2>/dev/null)
+      done < <(iptables -t "$table" -S "$chain" 2>/dev/null || true)
     done
   done
+}
+
+# ============================================================
+# IP forwarding (server2 / relay only)
+#
+# The relay DNATs the client's UDP over to Server 1, so the kernel has to
+# *forward* those packets. With net.ipv4.ip_forward=0 they're dropped right
+# after the DNAT with nothing logged anywhere - iptables counters even show
+# the rule matching - so the tunnel just silently never comes up. Hence:
+# persist it, apply it live, and verify it actually took rather than assuming.
+# ============================================================
+SYSCTL_DROPIN="/etc/sysctl.d/99-zzz-mimic-tunnel-forward.conf"
+SYSCTL_DROPIN_LEGACY="/etc/sysctl.d/99-mimic-tunnel-forward.conf"
+
+# Current runtime value, or 0 if it can't be read at all.
+ip_forward_now() { cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0; }
+
+# Any *other* config file that explicitly turns forwarding off is worth
+# naming: on a reboot it's a coin flip which one systemd-sysctl applies last,
+# and "worked until I rebooted" is a miserable thing to debug.
+warn_conflicting_forward_setting() {
+  local hits
+  hits="$(grep -rlE '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*0' \
+            /etc/sysctl.conf /etc/sysctl.d /usr/lib/sysctl.d /run/sysctl.d 2>/dev/null \
+          | grep -v "^${SYSCTL_DROPIN}$" || true)"
+  [[ -z "$hits" ]] && return 0
+  c_yellow "Warning: these files set net.ipv4.ip_forward=0 and fight this setting on every boot:"
+  # shellcheck disable=SC2086
+  printf '    %s\n' $hits
+  c_yellow "$SYSCTL_DROPIN is named to sort last so it should win, and mimic-tunnel-rules.service"
+  c_yellow "re-asserts it at boot anyway - but you may want to clean them up."
+  return 0
+}
+
+# enable_ip_forward [quiet]
+# Persists net.ipv4.ip_forward=1, applies it to the running kernel, and
+# confirms /proc actually reads back 1. Never fatal: a relay with forwarding
+# off is broken, but aborting the install helps nobody.
+enable_ip_forward() {
+  local quiet="${1:-}" fwd
+
+  # This filename deliberately sorts *after* 99-sysctl.conf: systemd-sysctl
+  # processes /etc/sysctl.conf as though it were /etc/sysctl.d/99-sysctl.conf,
+  # and the old 99-mimic-tunnel-forward.conf name sorted before it - so a
+  # stale ip_forward=0 in /etc/sysctl.conf silently overrode us at boot.
+  rm -f "$SYSCTL_DROPIN_LEGACY"
+  mkdir -p "$(dirname "$SYSCTL_DROPIN")"
+  {
+    echo "# managed by mimic-tunnel - the relay forwards DNAT'd traffic to Server 1"
+    echo "net.ipv4.ip_forward=1"
+  } > "$SYSCTL_DROPIN"
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || \
+    sysctl -p "$SYSCTL_DROPIN" >/dev/null 2>&1 || true
+
+  fwd="$(ip_forward_now)"
+  if [[ "$fwd" == "1" ]]; then
+    if [[ "$quiet" != "quiet" ]]; then
+      c_green "-> IP forwarding is on, and persisted in $SYSCTL_DROPIN."
+      warn_conflicting_forward_setting
+    fi
+    return 0
+  fi
+
+  c_red "Warning: net.ipv4.ip_forward is still $fwd after trying to enable it."
+  c_red "Until it's 1, this relay will accept the client's packets and drop them after DNAT,"
+  c_red "so the tunnel will look configured but carry no traffic. This usually means the"
+  c_red "environment blocks sysctl writes (an unprivileged container, or a read-only /proc/sys)."
+  c_red "The setting is saved in $SYSCTL_DROPIN, so a reboot may fix it."
+  return 1
 }
 
 apply_tunnel_from_disk() {
@@ -268,7 +358,15 @@ cmd_apply_rules() {
     # wipe every mimic-tunnel-tagged rule first so leftover/stale rules from
     # past drift can never shadow the current config, then lay down exactly
     # what's configured now.
-    [[ "$action" == "add" ]] && flush_all_mimic_tunnel_rules
+    if [[ "$action" == "add" ]]; then
+      flush_all_mimic_tunnel_rules
+      # Re-assert forwarding here rather than trusting sysctl.d alone: this
+      # service runs after network-online.target, i.e. long after
+      # systemd-sysctl, so it wins over anything that reset it during boot.
+      if [[ "$ROLE" == "server2" ]]; then
+        enable_ip_forward quiet || true
+      fi
+    fi
     local n
     for n in $(list_tunnel_names); do
       apply_tunnel_from_disk "$n" "$action"
@@ -433,7 +531,8 @@ ensure_rules_service() {
   [[ -f "$RULES_UNIT" ]] && return 0
   c_yellow "-> mimic-tunnel-rules.service was missing (likely from an earlier interrupted install) - recreating it."
   install_rules_service
-  systemctl enable --now mimic-tunnel-rules.service
+  systemctl enable --now mimic-tunnel-rules.service || \
+    c_yellow "Warning: recreated the unit but it didn't start (see: journalctl -u mimic-tunnel-rules)."
 }
 
 # ============================================================
@@ -506,18 +605,22 @@ cmd_install() {
   mkdir -p "$TUNNELS_DIR"
   regen_mimic_filter_config
   install_rules_service
-  systemctl enable --now mimic-tunnel-rules.service
 
   if [[ "$ROLE" == "server2" ]]; then
-    # A dedicated sysctl.d fragment survives package upgrades that reset
-    # /etc/sysctl.conf to its packaged default (e.g. procps) - editing that
-    # file in place doesn't.
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-mimic-tunnel-forward.conf
-    sysctl -p /etc/sysctl.d/99-mimic-tunnel-forward.conf >/dev/null 2>&1 || \
-      c_yellow "Warning: could not set net.ipv4.ip_forward live (this environment may restrict sysctl writes) - it's saved in /etc/sysctl.d/99-mimic-tunnel-forward.conf so it should take effect on next boot; set it manually now if you need it immediately."
+    enable_ip_forward || true
   fi
 
-  systemctl enable --now "mimic@${IFACE}"
+  # Deliberately non-fatal from here on: a service that won't start is worth
+  # a loud warning, but it must not abort the install and take the "add a
+  # tunnel now?" prompt down with it.
+  systemctl enable --now mimic-tunnel-rules.service || \
+    c_yellow "Warning: mimic-tunnel-rules.service didn't start (see: journalctl -u mimic-tunnel-rules). Rules added below still apply now, but may not survive a reboot."
+
+  # Only enabled, not started, when there's nothing to carry yet: Mimic with
+  # zero filters just logs "no filter specified" and does nothing useful.
+  # cmd_tunnel_add starts it as soon as the first tunnel exists.
+  systemctl enable "mimic@${IFACE}" >/dev/null 2>&1 || \
+    c_yellow "Warning: could not enable mimic@${IFACE} for boot (see: systemctl status mimic@${IFACE})."
 
   echo
   c_green "== Base install complete =="
@@ -533,7 +636,8 @@ cmd_install() {
     echo "Add one later with: mimic-tunnel tunnel add"
   else
     c_yellow "-> Restarting Mimic to apply current settings to existing tunnels..."
-    systemctl restart "mimic@${IFACE}"
+    systemctl restart "mimic@${IFACE}" || \
+      c_yellow "Warning: mimic@${IFACE} failed to restart (see: systemctl status mimic@${IFACE})."
   fi
 }
 
@@ -573,9 +677,11 @@ cmd_uninstall() {
     echo "Note: the mimic package itself was left installed. Use 'uninstall --purge' to remove it too."
   fi
   if [[ "$ROLE" == "server2" ]]; then
-    echo "Note: net.ipv4.ip_forward=1 (set in /etc/sysctl.conf by install) was left as-is in case"
-    echo "anything else on this server relies on it. Revert manually if you don't need it:"
-    echo "    sudo sed -i 's/^net.ipv4.ip_forward=1/net.ipv4.ip_forward=0/' /etc/sysctl.conf && sudo sysctl -p"
+    rm -f "$SYSCTL_DROPIN" "$SYSCTL_DROPIN_LEGACY"
+    echo "Note: removed our sysctl drop-in, but net.ipv4.ip_forward is left ON in the running"
+    echo "kernel in case something else here (WireGuard, another NAT) still needs it. It reverts"
+    echo "to this system's own default on the next reboot. To turn it off right now:"
+    echo "    sudo sysctl -w net.ipv4.ip_forward=0"
   fi
 }
 
@@ -704,8 +810,9 @@ cmd_tunnel_add() {
   write_tunnel "$name"
   regen_mimic_filter_config
   tunnel_rules "$name" add "$PEER_IP" "$DISGUISE_PORT" "$new_port"
-  systemctl enable --now "mimic@${IFACE}"
-  systemctl restart "mimic@${IFACE}"
+  systemctl enable "mimic@${IFACE}" >/dev/null 2>&1 || true
+  systemctl restart "mimic@${IFACE}" || \
+    c_yellow "Warning: mimic@${IFACE} failed to start - the tunnel is configured but not obfuscating yet (see: systemctl status mimic@${IFACE})."
 
   tunnel_summary_and_next_steps "$name"
 }
@@ -807,7 +914,8 @@ MAX_SHOWN_CONNECTIONS=20
 limit_mimic_connections() {
   local max="$MAX_SHOWN_CONNECTIONS" content total
   content="$(cat)"
-  total="$(grep -c '^Connection ' <<<"$content")"
+  # grep -c exits 1 when the count is zero, which is a normal state here.
+  total="$(grep -c '^Connection ' <<<"$content" || true)"
   if [[ "$content" == "Connection no active connection" ]] || (( total <= max )); then
     printf '%s\n' "$content"
     return
@@ -831,9 +939,10 @@ cmd_status() {
   [[ "$ROLE" == "server1" ]] && echo "Public IP:     $PUBLIC_IP"
   if [[ "$ROLE" == "server2" ]]; then
     local fwd
-    fwd="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo '?')"
+    fwd="$(ip_forward_now)"
     if [[ "$fwd" != "1" ]]; then
-      c_red "IP forwarding is OFF (net.ipv4.ip_forward=$fwd) - DNAT'd traffic is silently dropped before it ever reaches the peer. Fix: sysctl -w net.ipv4.ip_forward=1 (re-run 'mimic-tunnel install' to persist it properly)."
+      c_red "IP forwarding is OFF (net.ipv4.ip_forward=$fwd) - DNAT'd traffic is silently dropped before it ever reaches the peer."
+      c_red "Fix it (applies now and persists): sudo systemctl restart mimic-tunnel-rules"
     fi
   fi
   echo

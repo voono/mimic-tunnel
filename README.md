@@ -220,9 +220,30 @@ then deletes the config, the Mimic filter file, the systemd unit, and the
 installed `/usr/local/sbin/mimic-tunnel` binary. Left behind on purpose:
 
 - The `mimic` package and kernel module, unless you pass `--purge`.
-- `net.ipv4.ip_forward=1` on Server 2 (set persistently by install) — not
-  reverted automatically in case something else on the box relies on it;
-  `uninstall` prints the one-liner to undo it if you don't need it.
+- `net.ipv4.ip_forward=1` on Server 2 in the *running* kernel — the sysctl
+  drop-in is deleted, so it reverts to your system's own default on the next
+  reboot, but the live setting is left on in case something else on the box
+  (WireGuard, another NAT) relies on it. `uninstall` prints the one-liner to
+  turn it off immediately.
+
+### IP forwarding on Server 2
+
+Server 2 DNATs the client's UDP over to Server 1, so the kernel has to
+*forward* those packets. With `net.ipv4.ip_forward=0` they are dropped right
+after the DNAT with nothing logged — the iptables counters even tick up, so
+the tunnel looks configured but carries no traffic. The installer therefore:
+
+- writes `/etc/sysctl.d/99-zzz-mimic-tunnel-forward.conf`, deliberately named
+  to sort *after* `99-sysctl.conf` (systemd applies `/etc/sysctl.conf` as if it
+  were that file), so a stale `ip_forward=0` there can't win at boot;
+- applies it to the running kernel and then **verifies** `/proc` reads back
+  `1`, warning loudly if the environment refused the write;
+- re-asserts it on every boot from `mimic-tunnel-rules.service`, which runs
+  after `network-online.target` — long after `systemd-sysctl` — so nothing
+  that flips it during boot can leave the relay broken.
+
+`mimic-tunnel status` flags it in red if forwarding is ever off;
+`sudo systemctl restart mimic-tunnel-rules` re-applies it.
 
 ## References
 
